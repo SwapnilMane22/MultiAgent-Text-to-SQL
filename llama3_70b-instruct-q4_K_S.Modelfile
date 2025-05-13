@@ -1,0 +1,5 @@
+FROM llama3:70b-instruct-q4_K_S
+            PARAMETER num_gpu 16
+            PARAMETER num_ctx 768
+            PARAMETER num_threads 4
+            PARAMETER numa true

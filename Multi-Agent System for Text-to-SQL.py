@@ -23,6 +23,7 @@ from pathlib import Path
 import sys
 import io
 import copy
+import spacy
 
 # In[ ]:
 
@@ -41,7 +42,7 @@ print(f"Virtual Memory: {psutil.virtual_memory().percent}%")
 def start_ollama_server():
     """Start Ollama server with error-level logging"""
     env = os.environ.copy()
-    env["OLLAMA_LOG_LEVEL"] = "error"
+    # env["OLLAMA_LOG_LEVEL"] = "error"
     
     try:
         # Start Ollama with error logging
@@ -75,12 +76,19 @@ ollama_process = start_ollama_server()
 # sqlcoder:70b-alpha-q3_K_L
 # phi4-reasoning:14b-plus-q4_K_M
 # sqlcoder:15b-q3_K_L
+# sqlcoder:7b-q3_K_L
+# phi4-mini-reasoning:3.8b-q4_K_M
+# opencoder:8b-instruct-q4_K_M
+# gemma3:27b-it-q4_K_M
+
+model2 = "deepcoder:1.5b-preview-fp16"
+model1 = "phi4-mini-reasoning:3.8b-q4_K_M"
 
 def verify_models():
     available_models = [m['model'] for m in ollama.list()['models']]
     required_models = [
-        "sqlcoder:7b-q3_K_L",
-        "phi4-mini-reasoning:3.8b-q4_K_M"
+        model1,
+        model2
     ]
 
     for model in required_models:
@@ -293,14 +301,14 @@ def resource_monitor():
 # Configuration for Ollama models
 LLM_CONFIG = [
     {  # First model config
-        "model": "sqlcoder:7b-q3_K_L",
+        "model": model1, # #sqlcoder:7b-q3_K_L
         "base_url": "http://localhost:11434/v1",
         "api_key": "ollama",
         "timeout": 500,
         "price": [0.0, 0.0],
     },
     {  # Second model config
-        "model": "phi4-mini-reasoning:3.8b-q4_K_M", 
+        "model": model2, 
         "base_url": "http://localhost:11434/v1",
         "api_key": "ollama",
         "timeout": 500,
@@ -317,55 +325,104 @@ LLM_CONFIG = [
 # In[ ]:
 
 
-class CustomGroupChatManager(GroupChatManager):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.accuracy_data = {"total": 0, "success": 0}
+# class CustomGroupChatManager(GroupChatManager):
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         self.accuracy_data = {"total": 0, "success": 0}
 
-    def track_success(self, success: bool):
-        self.accuracy_data["total"] += 1
-        if success:
-            self.accuracy_data["success"] += 1
+#     def track_success(self, success: bool):
+#         self.accuracy_data["total"] += 1
+#         if success:
+#             self.accuracy_data["success"] += 1
 
-    def select_speaker(self, last_speaker: Agent, selector: Agent):
-        """Speaker selection logic"""
-        # Get full conversation history
-        conv_history = self.groupchat.messages
+#     def select_speaker(self, last_speaker: Agent, selector: Agent):
+#         """Speaker selection logic"""
+#         # Get full conversation history
+#         conv_history = self.groupchat.messages
         
-        # Determine next speaker based on agent roles
-        if last_speaker == agent1:  # After schema analysis
-            return agent2  # Always route to SQL engineer
+#         # Determine next speaker based on agent roles
+#         if last_speaker == agent1:  # After schema analysis
+#             return agent2  # Always route to SQL engineer
             
-        elif last_speaker == agent2:  # After SQL generation
-            return agent3  # Always validate
+#         elif last_speaker == agent2:  # After SQL generation
+#             return agent3  # Always validate
             
-        elif last_speaker == agent3:  # After validation
-            last_message = conv_history[-1]["content"] if conv_history else ""
-            if "SUCCESS" in last_message:
-                self.track_success(True)
-            else:
-                self.track_success(False)
-            return None  # Terminate conversation after successful validation
+#         elif last_speaker == agent3:  # After validation
+#             last_message = conv_history[-1]["content"] if conv_history else ""
+#             if "SUCCESS" in last_message:
+#                 self.track_success(True)
+#             else:
+#                 self.track_success(False)
+#             return None  # Terminate conversation after successful validation
                 
-        else:  # Initial message
-            return agent1  # Start with new schema analysis
+#         else:  # Initial message
+#             return agent1  # Start with new schema analysis
 
-    def get_accuracy(self):
-        if self.accuracy_data["total"] == 0:
-            return 0.0
-        return (self.accuracy_data["success"] / self.accuracy_data["total"]) * 100
+#     def get_accuracy(self):
+#         if self.accuracy_data["total"] == 0:
+#             return 0.0
+#         return (self.accuracy_data["success"] / self.accuracy_data["total"]) * 100
 
 
 # In[ ]:
 
+# Load spaCy NER model
+nlp = spacy.load("en_core_web_sm")
 
-# Agent 1: Schema Mapping Agent
-agent1 = AssistantAgent(
-    name="Database_Schema_Mapper",
-    system_message=f"""
+
+# --- NER Extraction ---
+def extract_keywords(question):
+    doc = nlp(question)
+    # Extract named entities + noun chunks
+    keywords = set(ent.text.lower() for ent in doc.ents)
+    keywords.update(chunk.root.text.lower() for chunk in doc.noun_chunks)
+    return list(keywords)
+
+# --- Schema Matcher ---
+def match_schema(keywords, schema_dict):
+    matched = {}
+    for table, columns in schema_dict.items():
+        table_lower = table.lower()
+        match_found = any(kw in table_lower for kw in keywords)
+        matched_columns = [col for col in columns if any(kw in col.lower() for kw in keywords)]
+
+        if match_found or matched_columns:
+            matched[table] = matched_columns if matched_columns else columns
+    return matched
+
+# --- Prompt Builder ---
+def build_prompt(question, matched_schema):
+    schema_str = "\n".join([f"- {tbl}({', '.join(cols)})" for tbl, cols in matched_schema.items()])
+    return f"""
     You are a database schema expert.
 
-    Given a question, evidence, below schema and goal, you must identify and match relevant entities (such as table names and column names) using Named Entity Recognition (NER), keyword matching, or semantic similarity with the provided database schema.
+    Given a Question: {question}, below schema, you must identify and match relevant entities (such as table names and column names) and explain the question to provide similarity with the provided database schema.
+
+    We want to specifically use ONLY the below provided schema to derive the required table columns and relationships:
+
+    Schema:
+    {json.dumps(schema_str, indent=2)}
+
+
+    Fetched Schema:
+
+    {json.dumps(schema_str, indent=2)}
+
+    Steps to follow:
+    1. Explain the question to provide similarity with the provided database schema. Identify the entities in the question and determine which category they would belong to and then breakdown the question into sub question w.r.t. the schema.
+    2. Match these entities with relevant table names and column names specifically from the provided schema ONLY. Additionally, if you're not able to explain the {question} then ONLY look up at entire database schema ONLY to avoid halucination using the SCHEMA: {json.dumps(schema, indent=2)}
+    3. Identify relationships using 'related_tables' to determine necessary joins.
+    4. Summarise which all tables are needed along with it's column names fetched directly from the schema in the json format.
+
+    The output should be summarised json format with tables, columns and related tables along with the {question}.
+
+    Strictly, Do NOT explain anything. Only return output JSON (with tables, columns, and related tables), question. Pass this output json to {{MySQL_Database_Engineer}}.
+    """
+
+
+    """You are a database schema expert.
+
+    Given a question, below schema and goal, you must identify and match relevant entities (such as table names and column names) using Named Entity Recognition (NER), keyword matching, or semantic similarity with the provided database schema. Strictly, Do NOT explain anything
 
     We want to specifically use ONLY the below provided schema to derive the required table columns and relationships:
 
@@ -374,19 +431,117 @@ agent1 = AssistantAgent(
     {json.dumps(schema, indent=2)}
 
     Steps to follow:
-    1. Use NER or semantic parsing to identify key entities (people, dates, account IDs, etc.) from the input.
+    1. Use NER or semantic parsing to identify key entities (people, dates, account IDs, etc.) from the input question along with schema.
     2. Match these entities with relevant table names and column names specifically from the provided schema ONLY. 
+    3. Identify relationships using 'related_tables' to determine necessary joins.
+    4. Summarise which all tables are needed along with it's column names fetched directly from the schema in the json format.
+
+    The output should be summarised json format with tables, columns and related tables along with the {question}.
+
+    Strictly, Do NOT explain anything. Only return output JSON (with tables, columns, and related tables), question. Pass this output json to {{MySQL_Database_Engineer}}.
+    """
+
+
+    """
+    You are a database schema expert.
+
+    Given a Question: {question}, below schema, you must identify and match relevant entities (such as table names and column names) and explain the question to provide similarity with the provided database schema.
+
+    We want to specifically use ONLY the below provided schema to derive the required table columns and relationships:
+
+    SCHEMA:
+
+    {json.dumps(schema_str, indent=2)}
+
+    Steps to follow:
+    1. Explain the question to provide similarity with the provided database schema.
+    2. Match these entities with relevant table names and column names specifically from the provided schema ONLY. Additionally, if you're not able to explain the {question} then ONLY look up at entire database schema ONLY to avoid halucination using the SCHEMA: {json.dumps(schema, indent=2)}
     3. Identify relationships using 'related_tables' to determine necessary joins.
 
     Your output must be in **JSON** format:
     {{
-      "table_name": {{
-        "columns": ["col1", "col2"],
-        "related_tables": ["other_table"]
-      }},
-      ...
+        "Schema": {json.dumps(schema_str, indent=2)},
+        "Question": "{question}"
     }}
-    Do NOT explain anything. Only return output JSON (with tables, columns, and related tables), question, and evidence.
+    Strictly, Do NOT explain anything. Only return output JSON (with tables, columns, and related tables), question, and evidence. Pass this output json to {{MySQL_Database_Engineer}}.
+    """
+
+#     return f"""You are a helpful SQL assistant.
+
+# Only use the following database schema to answer the question:
+
+# {schema_str}
+
+# User Question: {question}
+
+# Return a valid SQL query that answers the question.
+# """
+
+# # Agent 1: Schema Mapping Agent
+# agent1 = AssistantAgent(
+#     name="Database_Schema_Mapper",
+#     system_message=f"""
+#     You are a database schema expert.
+
+#     Given a question, below schema and goal, you must identify and match relevant entities (such as table names and column names) using Named Entity Recognition (NER), keyword matching, or semantic similarity with the provided database schema.
+
+#     We want to specifically use ONLY the below provided schema to derive the required table columns and relationships:
+
+#     SCHEMA:
+
+#     {json.dumps(schema, indent=2)}
+
+#     Steps to follow:
+#     1. Use NER or semantic parsing to identify key entities (people, dates, account IDs, etc.) from the input question along with schema.
+#     2. Match these entities with relevant table names and column names specifically from the provided schema ONLY. 
+#     3. Identify relationships using 'related_tables' to determine necessary joins.
+
+#     Your output must be in **JSON** format:
+#     {{
+#       "table_name <from the given schema>": {{
+#         "columns": ["col1", "col2"],
+#         "related_tables": ["other_table"]
+#       }},
+#       Question: {{Question}}
+#     }}
+#     Strictly, Do NOT explain anything. Only return output JSON (with tables, columns, and related tables), question, and evidence. Pass this output json to {{MySQL_Database_Engineer}}.
+#     """,
+#     llm_config={
+#         "config_list": [{
+#             "model": LLM_CONFIG[1]["model"],
+#             "base_url": LLM_CONFIG[1]["base_url"],
+#             "api_key": LLM_CONFIG[1]["api_key"],
+#             "price": LLM_CONFIG[1]["price"]
+#         }],
+#         "timeout": LLM_CONFIG[1]["timeout"]
+#     },
+#     max_consecutive_auto_reply=10,
+# )
+
+
+# In[ ]:
+
+
+# Agent 2: SQL Generation Agent
+agent2 = AssistantAgent(
+    name="MySQL_Database_Engineer",
+    system_message="""You are responsible for validating SQL query outputs by comparing them with the input question. Your goals are:
+    1. Take the input from {Database_Schema_Mapper} and parse the output {SQL Query}
+    2. Ensure the generated SQL query meets all requirements stated in the question and is supported by the evidence.
+    3. Attempt to execute the query and validate its correctness based on the execution result.
+    4. Write the final MySQL query
+    5. Make sure the sql query is executable
+    6. Return ONLY the MySQL query without any explanation that would provide output for the input question.
+
+    Provide RLAIF-style feedback as follows:
+    - If the query is correct and executes successfully: 
+      "SUCCESS: [brief description of execution result]"
+
+    - If the query is incorrect or execution fails: 
+      "ERROR: [error details]. Needed corrections: [specific and actionable fixes]"
+
+    Maintain the conversation history to support iterative improvements. 
+    Strictly, Do NOT explain anything, just return the output MySQL query. Pass this MySQL query to {SQL_Validator}. If the output is empty, circle back to {Database_Schema_Mapper}
     """,
     llm_config={
         "config_list": [{
@@ -397,34 +552,7 @@ agent1 = AssistantAgent(
         }],
         "timeout": LLM_CONFIG[1]["timeout"]
     },
-    max_consecutive_auto_reply=10,
-)
-
-
-# In[ ]:
-
-
-# Agent 2: SQL Generation Agent
-agent2 = AssistantAgent(
-    name="MySQL_Database_Engineer",
-    system_message="""You are an expert SQL writer. Using the schema analysis from Database_Schema_Mapper:
-
-    1. Break down the input questions into subqueries using the evidence
-    2. Handle joins, nested queries, and aggregation
-    3. Ensure MySQL syntax compliance
-    4. Consider performance optimization
-    5. Write the final MySQL query
-    6. Make sure the sql query is executable
-    7. Return ONLY the MySQL query without any explanation that would provide output for the input question.""",
-    llm_config={
-        "config_list": [{
-            "model": LLM_CONFIG[0]["model"],
-            "base_url": LLM_CONFIG[0]["base_url"],
-            "api_key": LLM_CONFIG[0]["api_key"],
-            "price": LLM_CONFIG[0]["price"]
-        }],
-        "timeout": LLM_CONFIG[0]["timeout"]
-    },
+    function_map={"perform_query_on_mysql_databases": perform_query_on_mysql_databases},
     max_consecutive_auto_reply=10,
 )
 
@@ -438,8 +566,9 @@ agent3 = UserProxyAgent(
     human_input_mode="NEVER",
     system_message="""
     You are responsible for validating SQL query outputs by comparing them with the input question and provided evidence. Your goals are:
-    1. Ensure the generated SQL query meets all requirements stated in the question and is supported by the evidence.
-    2. Attempt to execute the query and validate its correctness based on the execution result.
+    1. Take the input from {MySQL_Database_Engineer} and parse the output {SQL Query}
+    2. Ensure the generated SQL query meets all requirements stated in the question and is supported by the evidence.
+    3. Attempt to execute the query and validate its correctness based on the execution result.
 
     Provide RLAIF-style feedback as follows:
     - If the query is correct and executes successfully: 
@@ -458,12 +587,12 @@ agent3 = UserProxyAgent(
     },
     llm_config={
         "config_list": [{
-            "model": LLM_CONFIG[1]["model"],
-            "base_url": LLM_CONFIG[1]["base_url"],
-            "api_key": LLM_CONFIG[1]["api_key"],
-            "price": LLM_CONFIG[1]["price"]
+            "model": LLM_CONFIG[0]["model"],
+            "base_url": LLM_CONFIG[0]["base_url"],
+            "api_key": LLM_CONFIG[0]["api_key"],
+            "price": LLM_CONFIG[0]["price"]
         }],
-        "timeout": LLM_CONFIG[1]["timeout"]
+        "timeout": LLM_CONFIG[0]["timeout"]
     },
     function_map={"perform_query_on_mysql_databases": perform_query_on_mysql_databases},
 )
@@ -472,29 +601,7 @@ agent3 = UserProxyAgent(
 # In[ ]:
 
 
-# Agent 4: Group Manager
-agent4 = CustomGroupChatManager(
-    groupchat=GroupChat(
-        agents=[agent1, agent2, agent3],
-        messages=[],
-        max_round=15,
-        # speaker_selection_method="round_robin",
-        allow_repeat_speaker=[agent2] 
-    ),
-    name="Group_Manager",
-    system_message="Monitor SQL generation process. Count how many cases i.e. questions you've passed successfully and account for failures. Also provide Current execution accuracy: {accuracy}%",
-    llm_config={
-        "config_list": [{
-            "model": LLM_CONFIG[1]["model"],
-            "base_url": LLM_CONFIG[1]["base_url"],
-            "api_key": LLM_CONFIG[1]["api_key"],
-            "price": LLM_CONFIG[1]["price"]
-        }],
-        "timeout": LLM_CONFIG[1]["timeout"]
-    },
-)
-
-agent4.groupchat.speaker_selection_method = agent4.select_speaker
+# agent4.groupchat.speaker_selection_method = agent4.select_speaker
 
 # In[ ]:
 
@@ -522,53 +629,114 @@ def test_sql_generation(input_file: str):
     with open(input_file) as f:
         original_test_cases = json.load(f)
 
-    total_cases = len(original_test_cases)
+    
+    # Extract only the first 10 input test cases
+    # first_10_inputs = [tc["input"] for tc in original_test_cases[:10]]
+    total_cases = len(original_test_cases[:10])
     passed_cases = 0
     updated_test_cases = []
     output_file = "./output_minidev_results.json"
 
-    for idx, case in enumerate(original_test_cases, 1):
+    for idx, case in enumerate(original_test_cases[:10], 1):
         print(f"\nProcessing case {idx}/{total_cases}: {case['question']}")
-        agent1.clear_history()
         agent2.clear_history()
         agent3.clear_history()
-        agent4.groupchat.messages.clear()
+        # agent4.groupchat.messages.clear()
 
         updated_case = copy.deepcopy(case)
 
         try:
+            keywords = extract_keywords(case['question'])
+            matched_schema = match_schema(keywords, schema)
+            system_prompt = build_prompt(case['question'], matched_schema)
+            # Agent 1: Schema Mapping Agent
+            agent1 = AssistantAgent(
+                name="Database_Schema_Mapper",
+                system_message=system_prompt,
+                llm_config={
+                    "config_list": [{
+                        "model": LLM_CONFIG[0]["model"],
+                        "base_url": LLM_CONFIG[0]["base_url"],
+                        "api_key": LLM_CONFIG[0]["api_key"],
+                        "price": LLM_CONFIG[0]["price"]
+                    }],
+                    "timeout": LLM_CONFIG[0]["timeout"]
+                },
+                max_consecutive_auto_reply=10,
+            )
+
+            
+            # Agent 4: Group Manager
+            agent4 = GroupChatManager(
+                groupchat=GroupChat(
+                    agents=[agent1, agent2, agent3],
+                    messages=[],
+                    max_round=15,
+                    speaker_selection_method="round_robin",
+                    allow_repeat_speaker=[agent2] 
+                ),
+                name="Group_Manager",
+                system_message="Monitor SQL generation process. Count how many cases i.e. questions you've passed successfully and account for failures. Also provide Current execution accuracy: {accuracy}%",
+                llm_config={
+                    "config_list": [{
+                        "model": LLM_CONFIG[0]["model"],
+                        "base_url": LLM_CONFIG[0]["base_url"],
+                        "api_key": LLM_CONFIG[0]["api_key"],
+                        "price": LLM_CONFIG[0]["price"]
+                    }],
+                    "timeout": LLM_CONFIG[0]["timeout"]
+                },
+            )
+            agent4.groupchat.messages.clear()
+
             agent4.initiate_chat(
                 recipient=agent1,
+                # Schema: {json.dumps(schema, indent=2)}
+                # Goal: Generate executable MySQL query for the given question
                 message=f"""
                 Schema: {json.dumps(schema, indent=2)}
                 Question: {case['question']}
-                Evidence: {case['evidence']}
-                Goal: Generate executable MySQL query for the given question
                 """,
                 participants=[agent1, agent2, agent3]
             )
+
+
+            # print("=== Agent 1: MySQL_Database_Engineer ===")
+            # print("System Message:", agent1.system_message)
+
+            # print("Agent 1 output:", extract_last_query(agent4.chat_messages.get(agent1, [])))
+
+            # print("=== Agent 2: MySQL_Database_Engineer ===")
+            # print("System Message:", agent2.system_message)
+            # print("Generated SQL Query:", extract_last_query(agent4.chat_messages.get(agent2, [])))
+
+            # print("=== Agent 3: SQL_Validator ===")
+            # print("System Message:", agent3.system_message)
+            # print("Validation Result:", agent4.chat_messages.get(agent3, []))
+
+
 
             if agent4.groupchat.is_terminated:
                 print(f"⚠️ Max round limit reached for question: '{case['question']}'")
                 updated_test_cases.append(updated_case)
                 continue
 
-            generated_query = extract_last_query(agent4.chat_messages.get(agent3, []))
-            gold_query = case.get("SQL", "").strip()
+            if "SUCCESS" in agent4.chat_messages.get(agent3, []):
+                generated_query = extract_last_query(agent4.chat_messages.get(agent2, []))
+                gold_query = case.get("SQL", "").strip()
+                if not gold_query:
+                    print("⚠️ SQL field not found in test case, skipping.")
+                    updated_test_cases.append(updated_case)
+                    continue
 
-            if not gold_query:
-                print("⚠️ SQL field not found in test case, skipping.")
-                updated_test_cases.append(updated_case)
-                continue
+                success = compare_queries(generated_query, gold_query)
+                agent4.track_success(success)
 
-            success = compare_queries(generated_query, gold_query)
-            agent4.track_success(success)
-
-            if success:
-                passed_cases += 1
-                updated_case["output_MySQL"] = generated_query
-            else:
-                print("❌ Query mismatch or execution failure.")
+                if success:
+                    passed_cases += 1
+                    updated_case["output_MySQL"] = generated_query
+                else:
+                    print("❌ Query mismatch or execution failure.")
 
         except Exception as e:
             print(f"❌ Error processing question: {case['question']}\nError: {str(e)}")
@@ -617,156 +785,3 @@ try:
     )
 except Exception as e:
     print(f"Initialization failed: {e}")
-
-#
-# ,
-#         "./mini_dev/data_minidev/data_minidev/MINIDEV/mini_dev_mysql_gold.sql"
-
-
-# # LLM Configuration
-
-# In[ ]:
-
-
-# --------------------------
-# Hardware Optimization Setup
-# --------------------------
-# def optimize_ollama_models():
-#     # Configure Ollama to use GPU layers efficiently
-#     ollama_model_config = {
-#         "sqlcoder:7b-q3_K_L": {
-#             "num_gpu": 18,  # Layers on GPU (fits 6GB VRAM)
-#             "num_ctx": 768,  # Reduced context window
-#             "num_threads": 4,  # CPU threads
-#         },
-#         "phi4-mini-reasoning:3.8b-q4_K_M": {
-#             "num_gpu": 16,
-#             "num_ctx": 768,
-#             "num_threads": 4,
-#         }
-#     }
-
-#     client = Client()
-
-#     # Apply configurations
-#     for model, config in ollama_model_config.items():
-#         modelfile = f"""
-#             FROM {model}
-#             PARAMETER num_gpu {config['num_gpu']}
-#             PARAMETER num_ctx {config['num_ctx']}
-#             PARAMETER num_threads {config['num_threads']}
-#             PARAMETER numa true
-#         """
-
-#         # Write Modelfile to disk
-#         modelfile_path = f"{model.replace(':', '_')}.Modelfile"
-#         with open(modelfile_path, "w") as f:
-#             f.write(modelfile.strip())
-
-#         client.create(
-#             model=model,
-#             from_=model
-#         )
-
-#         # Optionally, remove the Modelfile after creation
-#         os.remove(modelfile_path)
-
-# optimize_ollama_models()
-
-
-# In[ ]:
-
-
-# class MemoryAwareManager(CustomGroupChatManager):
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         self.active_model = None
-
-#     def switch_model(self, model_name):
-#         """Unload current model and load new one"""
-#         if self.active_model:
-#             ollama.delete(self.active_model)
-#         ollama.create(model_name)
-#         self.active_model = model_name
-
-
-# In[ ]:
-
-
-# --------------------------
-# Modified Agent Workflow
-# --------------------------
-# def sequential_workflow(question_data):
-#     """Process one question at a time with memory cleanup"""
-#     manager = MemoryAwareManager(...)  # Initialize with previous config
-
-#     # Phase 1: Schema Mapping
-#     manager.switch_model("phi4-mini-reasoning:3.8b-q4_K_M")
-#     schema_result = agent1.generate_reply(
-#         f"Question: {question_data['question']}\nSchema: {SCHEMA}"
-#     )
-
-#     # Phase 2: SQL Generation
-#     manager.switch_model("sqlcoder:7b-q3_K_L")
-#     sql_query = agent2.generate_reply(schema_result)
-
-#     # Phase 3: Validation
-#     manager.switch_model("phi4-mini-reasoning:3.8b-q4_K_M")
-#     validation_result = agent3.validate_query(sql_query)
-
-#     return validation_result
-
-
-
-    # system_message="""You are a database schema expert. Analyze the input question and map it to the database schema.
-    # Available schema format for the current database:
-    # {schema}
-
-    # Output format must be JSON with tables as keys and values containing:
-    # - columns: list of relevant columns for the input
-    # - related_tables: list of tables needing joins
-    # """.format(
-    #     schema_example=json.dumps({
-    #         "account": {
-    #             "columns": ["account_id", "district_id", "frequency", "date"],
-    #             "related_tables": ["district", "disp", "loan", "order", "trans"]
-    #         },
-    #         "alignment": {
-    #             "columns": ["id", "alignment"],
-    #             "related_tables": ["superhero"]
-    #         }
-    #     }, indent=2),
-    #     schema=json.dumps(schema, indent=2)
-    # ),
-
-# def test_sql_generation(input_file: str, gold_file: str):
-#     with open(input_file) as f:
-#         test_cases = json.load(f)
-
-#     with open(gold_file) as f:
-#         gold_queries = f.read().split(';')
-
-#     for case in test_cases:
-#         print(f"\nProcessing case: {case['question']}")
-#         agent1.clear_history()
-#         # agent2.clear_tools()
-#         agent2.clear_history()
-
-#         # Initiate conversation
-#         # Database: {case['db_id']}
-#         agent4.initiate_chat(
-#             agent1,
-#             message=f"""
-#             Question: {case['question']}
-#             Evidence: {case['evidence']}
-#             Goal: Generate executable MySQL query for the given question
-#             """,
-#         )
-
-#         # Validate against gold standard
-#         generated_query = extract_last_query(agent4.chat_messages[agent3])
-#         gold_query = next(q for q in gold_queries if case['question'] in q)
-#         success = compare_queries(generated_query, gold_query)
-#         agent4.track_success(success)
-
-#         print(f"Accuracy: {agent4.get_accuracy():.2f}%")    
